@@ -10,29 +10,30 @@ pub type BitMaskWord = u16;
 pub const BITMASK_STRIDE: usize = 1;
 pub const BITMASK_MASK: BitMaskWord = 0xffff;
 
-pub type HashWord = u8;
-pub const HASH_MASK_HIGH_BIT: HashWord = 0b1000_0000;
-pub const HASH_MASK_LOW_BIT: HashWord = 0b0111_1111;
+pub type HashWord = u16;
+pub const HASH_MASK_HIGH_BIT: HashWord = 0b1000_0000_0000_0000;
+pub const HASH_MASK_LOW_BIT: HashWord = 0b0111_1111_1111_1111;
 
 /// Control byte value for an empty bucket.
-pub const EMPTY: HashWord = 0b1111_1111;
+pub const EMPTY: HashWord = 0b1111_1111_1111_1111;
 
 /// Control byte value for a deleted bucket.
-pub const DELETED: HashWord = 0b1000_0000;
+pub const DELETED: HashWord = 0b1000_0000_0000_0000;
+
 
 /// Abstraction over a group of control bytes which can be scanned in
 /// parallel.
 ///
 /// This implementation uses a 128-bit SSE value.
 #[derive(Copy, Clone)]
-pub struct Group(x86::__m128i);
+pub struct Group(x86::__m256i);
 
 // FIXME: https://github.com/rust-lang/rust-clippy/issues/3859
 #[allow(clippy::use_self)]
 impl Group {
     /// Number of bytes in the group.
-    pub const WIDTH: usize = mem::size_of::<Self>();
     pub const BYTES: usize = mem::size_of::<Self>();
+    pub const WIDTH: usize = 16;
 
     /// Returns a full group of empty bytes, suitable for use as the initial
     /// value for an empty hash table.
@@ -40,11 +41,11 @@ impl Group {
     /// This is guaranteed to be aligned to the group size.
     #[inline]
     #[allow(clippy::items_after_statements)]
-    pub const fn static_empty() -> &'static [u8; Group::WIDTH] {
+    pub const fn static_empty() -> &'static [u16; Group::WIDTH] {
         #[repr(C)]
         struct AlignedBytes {
             _align: [Group; 0],
-            bytes: [u8; Group::WIDTH],
+            bytes: [u16; Group::WIDTH],
         }
         const ALIGNED_BYTES: AlignedBytes = AlignedBytes {
             _align: [],
@@ -56,34 +57,34 @@ impl Group {
     /// Loads a group of bytes starting at the given address.
     #[inline]
     #[allow(clippy::cast_ptr_alignment)] // unaligned load
-    pub unsafe fn load(ptr: *const u8) -> Self {
-        Group(x86::_mm_loadu_si128(ptr.cast()))
+    pub unsafe fn load(ptr: *const u16) -> Self {
+        Group(x86::_mm256_loadu_si256(ptr.cast()))
     }
 
     /// Loads a group of bytes starting at the given address, which must be
     /// aligned to `mem::align_of::<Group>()`.
     #[inline]
     #[allow(clippy::cast_ptr_alignment)]
-    pub unsafe fn load_aligned(ptr: *const u8) -> Self {
+    pub unsafe fn load_aligned(ptr: *const u16) -> Self {
         // FIXME: use align_offset once it stabilizes
         debug_assert_eq!(ptr as usize & (mem::align_of::<Self>() - 1), 0);
-        Group(x86::_mm_load_si128(ptr.cast()))
+        Group(x86::_mm256_load_si256(ptr.cast()))
     }
 
     /// Stores the group of bytes to the given address, which must be
     /// aligned to `mem::align_of::<Group>()`.
     #[inline]
     #[allow(clippy::cast_ptr_alignment)]
-    pub unsafe fn store_aligned(self, ptr: *mut u8) {
+    pub unsafe fn store_aligned(self, ptr: *mut u16) {
         // FIXME: use align_offset once it stabilizes
         debug_assert_eq!(ptr as usize & (mem::align_of::<Self>() - 1), 0);
-        x86::_mm_store_si128(ptr.cast(), self.0);
+        x86::_mm256_store_si256(ptr.cast(), self.0);
     }
 
     /// Returns a `BitMask` indicating all bytes in the group which have
     /// the given value.
     #[inline]
-    pub fn match_byte(self, byte: u8) -> BitMask {
+    pub fn match_byte(self, byte: HashWord) -> BitMask {
         #[allow(
             clippy::cast_possible_wrap, // byte: u8 as i8
             // byte: i32 as u16
@@ -93,8 +94,13 @@ impl Group {
             clippy::cast_possible_truncation
         )]
         unsafe {
-            let cmp = x86::_mm_cmpeq_epi8(self.0, x86::_mm_set1_epi8(byte as i8));
-            BitMask(x86::_mm_movemask_epi8(cmp) as u16)
+            let cmp = x86::_mm256_cmpeq_epi16(self.0, x86::_mm256_set1_epi16(byte as i16));
+            // let bm = x86::_mm256_movemask_epi8(cmp) as u32;
+            // BitMask(x86::_pext_u32(bm, 0xAAAA_AAAA) as u16)
+
+            let lo = x86::_mm256_extracti128_si256::<0>(cmp);
+            let hi = x86::_mm256_extracti128_si256::<1>(cmp);
+            BitMask(x86::_mm_movemask_epi8(x86::_mm_packs_epi16(lo, hi)) as u16)
         }
     }
 
@@ -118,7 +124,9 @@ impl Group {
         )]
         unsafe {
             // A byte is EMPTY or DELETED iff the high bit is set
-            BitMask(x86::_mm_movemask_epi8(self.0) as u16)
+            let lo = x86::_mm256_extracti128_si256::<0>(self.0);
+            let hi = x86::_mm256_extracti128_si256::<1>(self.0);
+            BitMask(x86::_mm_movemask_epi8(x86::_mm_packs_epi16(lo, hi)) as u16)
         }
     }
 
@@ -145,11 +153,11 @@ impl Group {
             clippy::cast_possible_wrap, // byte: 0x80_u8 as i8
         )]
         unsafe {
-            let zero = x86::_mm_setzero_si128();
-            let special = x86::_mm_cmpgt_epi8(zero, self.0);
-            Group(x86::_mm_or_si128(
+            let zero = x86::_mm256_setzero_si256();
+            let special = x86::_mm256_cmpgt_epi16(zero, self.0);
+            Group(x86::_mm256_or_si256(
                 special,
-                x86::_mm_set1_epi8(0x80_u8 as i8),
+                x86::_mm256_set1_epi16(HASH_MASK_HIGH_BIT as i16),
             ))
         }
     }

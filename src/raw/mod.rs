@@ -18,7 +18,10 @@ cfg_if! {
     // I attempted an implementation on ARM using NEON instructions, but it
     // turns out that most NEON instructions have multi-cycle latency, which in
     // the end outweighs any gains over the generic implementation.
-    if #[cfg(all(
+    if #[cfg(all(feature = "avx2-16bit-hash", not(miri)))] {
+        mod avx2;
+        use avx2 as imp;
+    }else if #[cfg(all(
         target_feature = "sse2",
         any(target_arch = "x86", target_arch = "x86_64"),
         not(miri)
@@ -26,9 +29,12 @@ cfg_if! {
         mod sse2;
         use sse2 as imp;
     } else {
-        #[path = "generic.rs"]
-        mod generic;
-        use generic as imp;
+        #[path = "array.rs"]
+        mod array;
+        use array as imp;
+        // #[path = "generic.rs"]
+        // mod generic;
+        // use generic as imp;
     }
 }
 
@@ -38,7 +44,7 @@ pub(crate) use self::alloc::{do_alloc, Allocator, Global};
 mod bitmask;
 
 use self::bitmask::{BitMask, BitMaskIter};
-use self::imp::Group;
+use self::imp::{Group, HashWord, EMPTY, DELETED, HASH_MASK_HIGH_BIT, HASH_MASK_LOW_BIT};
 
 // Branch prediction hint. This is currently only available on nightly but it
 // consistently improves performance by 10-15%.
@@ -101,27 +107,22 @@ impl Fallibility {
     }
 }
 
-/// Control byte value for an empty bucket.
-const EMPTY: u8 = 0b1111_1111;
-
-/// Control byte value for a deleted bucket.
-const DELETED: u8 = 0b1000_0000;
 
 /// Checks whether a control byte represents a full bucket (top bit is clear).
 #[inline]
-fn is_full(ctrl: u8) -> bool {
-    ctrl & 0x80 == 0
+fn is_full(ctrl: HashWord) -> bool {
+    ctrl & HASH_MASK_HIGH_BIT == 0
 }
 
 /// Checks whether a control byte represents a special value (top bit is set).
 #[inline]
-fn is_special(ctrl: u8) -> bool {
-    ctrl & 0x80 != 0
+fn is_special(ctrl: HashWord) -> bool {
+    ctrl & HASH_MASK_HIGH_BIT != 0
 }
 
 /// Checks whether a special control value is EMPTY (just check 1 bit).
 #[inline]
-fn special_is_empty(ctrl: u8) -> bool {
+fn special_is_empty(ctrl: HashWord) -> bool {
     debug_assert!(is_special(ctrl));
     ctrl & 0x01 != 0
 }
@@ -144,13 +145,13 @@ const MIN_HASH_LEN: usize = if mem::size_of::<usize>() < mem::size_of::<u64>() {
 /// Secondary hash function, saved in the low 7 bits of the control byte.
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
-fn h2(hash: u64) -> u8 {
+fn h2(hash: u64) -> HashWord {
     // Grab the top 7 bits of the hash. While the hash is normally a full 64-bit
     // value, some hash functions (such as FxHash) produce a usize result
     // instead, which means that the top 32 bits are 0 on 32-bit platforms.
     // So we use MIN_HASH_LEN constant to handle this.
-    let top7 = hash >> (MIN_HASH_LEN * 8 - 7);
-    (top7 & 0x7f) as u8 // truncation
+    let top_bits = hash >> (MIN_HASH_LEN * 8 - mem::size_of::<HashWord>()*8-1);
+    top_bits as HashWord & HASH_MASK_LOW_BIT  // truncation
 }
 
 /// Probe sequence based on triangular numbers, which is guaranteed (since our
@@ -239,13 +240,15 @@ impl TableLayout {
     #[inline]
     const fn new<T>() -> Self {
         let layout = Layout::new::<T>();
+        let size = layout.size();
+        let ctrl_align = if layout.align() > Group::BYTES {
+            layout.align()
+        } else {
+            Group::BYTES
+        };
         Self {
-            size: layout.size(),
-            ctrl_align: if layout.align() > Group::WIDTH {
-                layout.align()
-            } else {
-                Group::WIDTH
-            },
+            size,
+            ctrl_align,
         }
     }
 
@@ -257,7 +260,7 @@ impl TableLayout {
         // Manual layout calculation since Layout methods are not yet stable.
         let ctrl_offset =
             size.checked_mul(buckets)?.checked_add(ctrl_align - 1)? & !(ctrl_align - 1);
-        let len = ctrl_offset.checked_add(buckets + Group::WIDTH)?;
+        let len = ctrl_offset.checked_add(buckets * mem::size_of::<HashWord>() + Group::BYTES)?;
 
         // We need an additional check to ensure that the allocation doesn't
         // exceed `isize::MAX` (https://github.com/rust-lang/rust/pull/95295).
@@ -382,7 +385,7 @@ struct RawTableInner<A> {
 
     // [Padding], T1, T2, ..., Tlast, C1, C2, ...
     //                                ^ points here
-    ctrl: NonNull<u8>,
+    ctrl: NonNull<HashWord>,
 
     // Number of elements that can be inserted before we need to grow the table
     growth_left: usize,
@@ -1049,7 +1052,7 @@ impl<T, A: Allocator + Clone> RawTable<T, A> {
                     None => unsafe { hint::unreachable_unchecked() },
                 };
             Some((
-                unsafe { NonNull::new_unchecked(self.table.ctrl.as_ptr().sub(ctrl_offset)) },
+                unsafe { NonNull::new_unchecked(self.table.ctrl.as_ptr().cast::<u8>().sub(ctrl_offset)) },
                 layout,
             ))
         };
@@ -1076,7 +1079,7 @@ impl<A> RawTableInner<A> {
     const fn new_in(alloc: A) -> Self {
         Self {
             // Be careful to cast the entire slice to a raw pointer.
-            ctrl: unsafe { NonNull::new_unchecked(Group::static_empty() as *const _ as *mut u8) },
+            ctrl: unsafe { NonNull::new_unchecked(Group::static_empty() as *const _ as *mut HashWord) },
             bucket_mask: 0,
             items: 0,
             growth_left: 0,
@@ -1102,11 +1105,11 @@ impl<A: Allocator + Clone> RawTableInner<A> {
         };
 
         let ptr: NonNull<u8> = match do_alloc(&alloc, layout) {
-            Ok(block) => block.cast(),
+            Ok(block) => block,
             Err(_) => return Err(fallibility.alloc_err(layout)),
         };
 
-        let ctrl = NonNull::new_unchecked(ptr.as_ptr().add(ctrl_offset));
+        let ctrl = NonNull::new_unchecked(ptr.as_ptr().add(ctrl_offset).cast());
         Ok(Self {
             ctrl,
             bucket_mask: buckets - 1,
@@ -1131,7 +1134,9 @@ impl<A: Allocator + Clone> RawTableInner<A> {
                     capacity_to_buckets(capacity).ok_or_else(|| fallibility.capacity_overflow())?;
 
                 let result = Self::new_uninitialized(alloc, table_layout, buckets, fallibility)?;
-                result.ctrl(0).write_bytes(EMPTY, result.num_ctrl_bytes());
+                let ptr = result.ctrl(0);
+                let num_bytes = result.num_ctrl_words();
+                ptr.write_bytes(u8::MAX, num_bytes);
 
                 Ok(result)
             }
@@ -1143,7 +1148,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     ///
     /// There must be at least 1 empty bucket in the table.
     #[inline]
-    unsafe fn prepare_insert_slot(&self, hash: u64) -> (usize, u8) {
+    unsafe fn prepare_insert_slot(&self, hash: u64) -> (usize, HashWord) {
         let index = self.find_insert_slot(hash);
         let old_ctrl = *self.ctrl(index);
         self.set_ctrl_h2(index, hash);
@@ -1285,7 +1290,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     }
 
     #[inline]
-    unsafe fn record_item_insert_at(&mut self, index: usize, old_ctrl: u8, hash: u64) {
+    unsafe fn record_item_insert_at(&mut self, index: usize, old_ctrl: HashWord, hash: u64) {
         self.growth_left -= usize::from(special_is_empty(old_ctrl));
         self.set_ctrl_h2(index, hash);
         self.items += 1;
@@ -1307,7 +1312,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     }
 
     #[inline]
-    unsafe fn replace_ctrl_h2(&self, index: usize, hash: u64) -> u8 {
+    unsafe fn replace_ctrl_h2(&self, index: usize, hash: u64) -> HashWord {
         let prev_ctrl = *self.ctrl(index);
         self.set_ctrl_h2(index, hash);
         prev_ctrl
@@ -1316,7 +1321,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     /// Sets a control byte, and possibly also the replicated control byte at
     /// the end of the array.
     #[inline]
-    unsafe fn set_ctrl(&self, index: usize, ctrl: u8) {
+    unsafe fn set_ctrl(&self, index: usize, ctrl: HashWord) {
         // Replicate the first Group::WIDTH control bytes at the end of
         // the array without using a branch:
         // - If index >= Group::WIDTH then index == index2.
@@ -1343,8 +1348,8 @@ impl<A: Allocator + Clone> RawTableInner<A> {
 
     /// Returns a pointer to a control byte.
     #[inline]
-    unsafe fn ctrl(&self, index: usize) -> *mut u8 {
-        debug_assert!(index < self.num_ctrl_bytes());
+    unsafe fn ctrl(&self, index: usize) -> *mut HashWord {
+        debug_assert!(index < self.num_ctrl_words(), "{} < {}", index, self.num_ctrl_words());
         self.ctrl.as_ptr().add(index)
     }
 
@@ -1360,13 +1365,18 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     /// The caller must ensure `index` is less than the number of buckets.
     #[inline]
     unsafe fn is_bucket_full(&self, index: usize) -> bool {
-        debug_assert!(index < self.buckets());
+        debug_assert!(index < self.buckets(), "{} < {}", index, self.buckets());
         is_full(*self.ctrl(index))
     }
 
     #[inline]
     fn num_ctrl_bytes(&self) -> usize {
-        self.bucket_mask + 1 + Group::WIDTH
+        (self.bucket_mask +1 ) * mem::size_of::<HashWord>() + Group::BYTES
+    }
+
+    #[inline]
+    fn num_ctrl_words(&self) -> usize {
+        self.num_ctrl_bytes() / mem::size_of::<HashWord>()
     }
 
     #[inline]
@@ -1600,7 +1610,7 @@ impl<A: Allocator + Clone> RawTableInner<A> {
             None => unsafe { hint::unreachable_unchecked() },
         };
         (
-            unsafe { NonNull::new_unchecked(self.ctrl.as_ptr().sub(ctrl_offset)) },
+            unsafe { NonNull::new_unchecked(self.ctrl.as_ptr().cast::<u8>().sub(ctrl_offset)) },
             layout,
         )
     }
@@ -1619,7 +1629,8 @@ impl<A: Allocator + Clone> RawTableInner<A> {
     fn clear_no_drop(&mut self) {
         if !self.is_empty_singleton() {
             unsafe {
-                self.ctrl(0).write_bytes(EMPTY, self.num_ctrl_bytes());
+                // TODO: EMPTY is all ones so can be written as multiple u8::MAX
+                self.ctrl(0).write_bytes(u8::MAX, self.num_ctrl_words());
             }
         }
         self.items = 0;
@@ -1749,7 +1760,7 @@ impl<T: Copy, A: Allocator + Clone> RawTableClone for RawTable<T, A> {
         source
             .table
             .ctrl(0)
-            .copy_to_nonoverlapping(self.table.ctrl(0), self.table.num_ctrl_bytes());
+            .copy_to_nonoverlapping(self.table.ctrl(0), self.table.num_ctrl_words());
         source
             .data_start()
             .copy_to_nonoverlapping(self.data_start(), self.table.buckets());
@@ -1770,7 +1781,7 @@ impl<T: Clone, A: Allocator + Clone> RawTable<T, A> {
         source
             .table
             .ctrl(0)
-            .copy_to_nonoverlapping(self.table.ctrl(0), self.table.num_ctrl_bytes());
+            .copy_to_nonoverlapping(self.table.ctrl(0), self.table.num_ctrl_words());
 
         // The cloning of elements may panic, in which case we need
         // to make sure we drop only the elements that have been
@@ -1903,10 +1914,10 @@ pub(crate) struct RawIterRange<T> {
 
     // Pointer to the next group of control bytes,
     // Must be aligned to the group size.
-    next_ctrl: *const u8,
+    next_ctrl: *const HashWord,
 
     // Pointer one past the last control byte of this range.
-    end: *const u8,
+    end: *const HashWord,
 }
 
 impl<T> RawIterRange<T> {
@@ -1914,7 +1925,7 @@ impl<T> RawIterRange<T> {
     ///
     /// The control byte address must be aligned to the group size.
     #[cfg_attr(feature = "inline-more", inline)]
-    unsafe fn new(ctrl: *const u8, data: Bucket<T>, len: usize) -> Self {
+    unsafe fn new(ctrl: *const HashWord, data: Bucket<T>, len: usize) -> Self {
         debug_assert_ne!(len, 0);
         debug_assert_eq!(ctrl as usize % Group::WIDTH, 0);
         let end = ctrl.add(len);
@@ -2397,7 +2408,7 @@ struct RawIterHashInner<'a, A: Allocator + Clone> {
     table: &'a RawTableInner<A>,
 
     // The top 7 bits of the hash.
-    h2_hash: u8,
+    h2_hash: HashWord,
 
     // The sequence of groups to probe in the search.
     probe_seq: ProbeSeq,

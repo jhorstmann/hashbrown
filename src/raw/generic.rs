@@ -1,5 +1,4 @@
 use super::bitmask::BitMask;
-use super::EMPTY;
 use core::{mem, ptr};
 
 // Use the native word size as the group size. Using a 64-bit group size on
@@ -26,6 +25,17 @@ pub const BITMASK_STRIDE: usize = 8;
 #[allow(clippy::cast_possible_truncation, clippy::unnecessary_cast)]
 pub const BITMASK_MASK: BitMaskWord = 0x8080_8080_8080_8080_u64 as GroupWord;
 
+pub type HashWord = u8;
+
+pub const HASH_MASK_HIGH_BIT: HashWord = 0b1000_0000;
+pub const HASH_MASK_LOW_BIT: HashWord = 0b0111_1111;
+
+/// Control byte value for an empty bucket.
+pub const EMPTY: HashWord = 0b1111_1111;
+
+/// Control byte value for a deleted bucket.
+pub const DELETED: HashWord = 0b1000_0000;
+
 /// Helper function to replicate a byte across a `GroupWord`.
 #[inline]
 fn repeat(byte: u8) -> GroupWord {
@@ -47,6 +57,7 @@ pub struct Group(GroupWord);
 impl Group {
     /// Number of bytes in the group.
     pub const WIDTH: usize = mem::size_of::<Self>();
+    pub const BYTES: usize = mem::size_of::<Self>();
 
     /// Returns a full group of empty bytes, suitable for use as the initial
     /// value for an empty hash table.

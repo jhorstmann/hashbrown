@@ -1,38 +1,34 @@
 use super::bitmask::BitMask;
 use core::mem;
 
-#[cfg(target_arch = "x86")]
-use core::arch::x86;
-#[cfg(target_arch = "x86_64")]
-use core::arch::x86_64 as x86;
-
 pub type BitMaskWord = u16;
 pub const BITMASK_STRIDE: usize = 1;
 pub const BITMASK_MASK: BitMaskWord = 0xffff;
 
-pub type HashWord = u8;
-pub const HASH_MASK_HIGH_BIT: HashWord = 0b1000_0000;
-pub const HASH_MASK_LOW_BIT: HashWord = 0b0111_1111;
+pub type HashWord = u16;
+pub const HASH_MASK_HIGH_BIT: HashWord = 0b1000_0000_0000_0000;
+pub const HASH_MASK_LOW_BIT: HashWord = 0b0111_1111_1111_1111;
 
 /// Control byte value for an empty bucket.
-pub const EMPTY: HashWord = 0b1111_1111;
+pub const EMPTY: HashWord = 0b1111_1111_1111_1111;
 
 /// Control byte value for a deleted bucket.
-pub const DELETED: HashWord = 0b1000_0000;
+pub const DELETED: HashWord = 0b1000_0000_0000_0000;
+
 
 /// Abstraction over a group of control bytes which can be scanned in
 /// parallel.
 ///
 /// This implementation uses a 128-bit SSE value.
 #[derive(Copy, Clone)]
-pub struct Group(x86::__m128i);
+pub struct Group([HashWord; 16]);
 
 // FIXME: https://github.com/rust-lang/rust-clippy/issues/3859
 #[allow(clippy::use_self)]
 impl Group {
     /// Number of bytes in the group.
-    pub const WIDTH: usize = mem::size_of::<Self>();
     pub const BYTES: usize = mem::size_of::<Self>();
+    pub const WIDTH: usize = 16;
 
     /// Returns a full group of empty bytes, suitable for use as the initial
     /// value for an empty hash table.
@@ -40,11 +36,11 @@ impl Group {
     /// This is guaranteed to be aligned to the group size.
     #[inline]
     #[allow(clippy::items_after_statements)]
-    pub const fn static_empty() -> &'static [u8; Group::WIDTH] {
+    pub const fn static_empty() -> &'static [u16; Group::WIDTH] {
         #[repr(C)]
         struct AlignedBytes {
             _align: [Group; 0],
-            bytes: [u8; Group::WIDTH],
+            bytes: [u16; Group::WIDTH],
         }
         const ALIGNED_BYTES: AlignedBytes = AlignedBytes {
             _align: [],
@@ -56,46 +52,41 @@ impl Group {
     /// Loads a group of bytes starting at the given address.
     #[inline]
     #[allow(clippy::cast_ptr_alignment)] // unaligned load
-    pub unsafe fn load(ptr: *const u8) -> Self {
-        Group(x86::_mm_loadu_si128(ptr.cast()))
+    pub unsafe fn load(ptr: *const u16) -> Self {
+        Group(ptr.cast::<[u16; 16]>().read_unaligned())
     }
 
     /// Loads a group of bytes starting at the given address, which must be
     /// aligned to `mem::align_of::<Group>()`.
     #[inline]
     #[allow(clippy::cast_ptr_alignment)]
-    pub unsafe fn load_aligned(ptr: *const u8) -> Self {
+    pub unsafe fn load_aligned(ptr: *const u16) -> Self {
         // FIXME: use align_offset once it stabilizes
         debug_assert_eq!(ptr as usize & (mem::align_of::<Self>() - 1), 0);
-        Group(x86::_mm_load_si128(ptr.cast()))
+        Group(ptr.cast::<[u16; 16]>().read())
     }
 
     /// Stores the group of bytes to the given address, which must be
     /// aligned to `mem::align_of::<Group>()`.
     #[inline]
     #[allow(clippy::cast_ptr_alignment)]
-    pub unsafe fn store_aligned(self, ptr: *mut u8) {
+    pub unsafe fn store_aligned(self, ptr: *mut u16) {
         // FIXME: use align_offset once it stabilizes
         debug_assert_eq!(ptr as usize & (mem::align_of::<Self>() - 1), 0);
-        x86::_mm_store_si128(ptr.cast(), self.0);
+        ptr.cast::<[u16; 16]>().write(self.0);
     }
 
     /// Returns a `BitMask` indicating all bytes in the group which have
     /// the given value.
     #[inline]
-    pub fn match_byte(self, byte: u8) -> BitMask {
-        #[allow(
-            clippy::cast_possible_wrap, // byte: u8 as i8
-            // byte: i32 as u16
-            //   note: _mm_movemask_epi8 returns a 16-bit mask in a i32, the
-            //   upper 16-bits of the i32 are zeroed:
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation
-        )]
-        unsafe {
-            let cmp = x86::_mm_cmpeq_epi8(self.0, x86::_mm_set1_epi8(byte as i8));
-            BitMask(x86::_mm_movemask_epi8(cmp) as u16)
-        }
+    pub fn match_byte(self, byte: HashWord) -> BitMask {
+        let mut mask = 0_u16;
+        self.0.iter().enumerate().for_each(|(i, word)| {
+            if byte == *word {
+                mask |= 1 << i
+            }
+        });
+        BitMask(mask)
     }
 
     /// Returns a `BitMask` indicating all bytes in the group which are
@@ -109,17 +100,13 @@ impl Group {
     /// `EMPTY` or `DELETED`.
     #[inline]
     pub fn match_empty_or_deleted(self) -> BitMask {
-        #[allow(
-            // byte: i32 as u16
-            //   note: _mm_movemask_epi8 returns a 16-bit mask in a i32, the
-            //   upper 16-bits of the i32 are zeroed:
-            clippy::cast_sign_loss,
-            clippy::cast_possible_truncation
-        )]
-        unsafe {
-            // A byte is EMPTY or DELETED iff the high bit is set
-            BitMask(x86::_mm_movemask_epi8(self.0) as u16)
-        }
+        let mut mask = 0_u16;
+        self.0.iter().enumerate().for_each(|(i, word)| {
+            if *word == EMPTY || *word == DELETED {
+                mask |= 1 << i
+            }
+        });
+        BitMask(mask)
     }
 
     /// Returns a `BitMask` indicating all bytes in the group which are full.
@@ -134,23 +121,14 @@ impl Group {
     /// - `FULL => DELETED`
     #[inline]
     pub fn convert_special_to_empty_and_full_to_deleted(self) -> Self {
-        // Map high_bit = 1 (EMPTY or DELETED) to 1111_1111
-        // and high_bit = 0 (FULL) to 1000_0000
-        //
-        // Here's this logic expanded to concrete values:
-        //   let special = 0 > byte = 1111_1111 (true) or 0000_0000 (false)
-        //   1111_1111 | 1000_0000 = 1111_1111
-        //   0000_0000 | 1000_0000 = 1000_0000
-        #[allow(
-            clippy::cast_possible_wrap, // byte: 0x80_u8 as i8
-        )]
-        unsafe {
-            let zero = x86::_mm_setzero_si128();
-            let special = x86::_mm_cmpgt_epi8(zero, self.0);
-            Group(x86::_mm_or_si128(
-                special,
-                x86::_mm_set1_epi8(0x80_u8 as i8),
-            ))
-        }
+        let mut array = self.0;
+        array.iter_mut().for_each(|word| {
+            if *word & HASH_MASK_HIGH_BIT != 0 {
+                *word = u16::MAX;
+            } else {
+                *word = HASH_MASK_HIGH_BIT;
+            }
+        });
+        Group(array)
     }
 }

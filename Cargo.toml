@@ -55,5 +55,7 @@ raw = []
 # time cost.
 inline-more = []
 
+avx2-16bit-hash = []
+
 [package.metadata.docs.rs]
 features = ["nightly", "rayon", "serde", "raw"]
